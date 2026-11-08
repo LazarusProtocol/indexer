@@ -4,6 +4,7 @@ services:
   postgres:
     image: postgres:16-alpine
     container_name: lazarus-postgres
+    profiles: ["local"]
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-lazarus_db}
       POSTGRES_USER: ${POSTGRES_USER:-lazarus}
@@ -22,6 +23,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: lazarus-redis
+    profiles: ["local"]
     command: ["redis-server", "--appendonly", "yes"]
     volumes:
       - redis_data:/data
@@ -60,16 +62,12 @@ services:
       CELERY_TASK_ALWAYS_EAGER: ${CELERY_TASK_ALWAYS_EAGER:-false}
       LAZARUS_VAULT_CONTRACT_ID: ${LAZARUS_VAULT_CONTRACT_ID:-CCWAH7BVPGYOEBPRFWPZIONBYUCCQH7OARGZLOD6ZV66SOAFBVA2DHD5}
       LAZARUS_SOROBAN_RPC_URL: ${LAZARUS_SOROBAN_RPC_URL:-https://soroban-testnet.stellar.org}
-      LAZARUS_ATTESTATION_ENCLAVE_URL: ${LAZARUS_ATTESTATION_ENCLAVE_URL:-http://host.docker.internal:8085}
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      LAZARUS_ATTESTATION_ENCLAVE_URL: ${LAZARUS_ATTESTATION_ENCLAVE_URL:-http://lazarus-attestation:8085}
+      LAZARUS_ATTESTATION_API_KEY: ${LAZARUS_ATTESTATION_API_KEY:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    ports:
-      - "${INDEXER_PORT:-8000}:8000"
+    expose:
+      - "8000"
     networks:
       - lazarus-net
     restart: unless-stopped
@@ -95,12 +93,8 @@ services:
       CELERY_RESULT_BACKEND: ${CELERY_RESULT_BACKEND:-redis://redis:6379/0}
       LAZARUS_VAULT_CONTRACT_ID: ${LAZARUS_VAULT_CONTRACT_ID:-CCWAH7BVPGYOEBPRFWPZIONBYUCCQH7OARGZLOD6ZV66SOAFBVA2DHD5}
       LAZARUS_SOROBAN_RPC_URL: ${LAZARUS_SOROBAN_RPC_URL:-https://soroban-testnet.stellar.org}
-      LAZARUS_ATTESTATION_ENCLAVE_URL: ${LAZARUS_ATTESTATION_ENCLAVE_URL:-http://host.docker.internal:8085}
-    depends_on:
-      postgres:
-        condition: service_healthy
-      redis:
-        condition: service_healthy
+      LAZARUS_ATTESTATION_ENCLAVE_URL: ${LAZARUS_ATTESTATION_ENCLAVE_URL:-http://lazarus-attestation:8085}
+      LAZARUS_ATTESTATION_API_KEY: ${LAZARUS_ATTESTATION_API_KEY:-}
     extra_hosts:
       - "host.docker.internal:host-gateway"
     networks:
