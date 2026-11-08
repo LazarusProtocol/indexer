@@ -39,7 +39,7 @@ DEMO_CONTRACTS = [
         ],
     },
     {
-        "contract_id": "CCWAH7BVPGYOEBPRFWPZIONBYUCCQH7OARGZLOD6ZV66SOAFBVA2DHD5",
+        "contract_id": "CBKFA2F7RUDGLJNE3K5X2XEXVXRJQ5AMB2NSPREDTATE2ZHDALFKPGUR",
         "protocol_type": "generic",
         "escrow_balance": Decimal("1000000000"),  # 100.00 USDC
         "fixed_bounty": Decimal("1000000"),       # 0.10 USDC

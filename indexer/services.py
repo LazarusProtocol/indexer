@@ -469,7 +469,7 @@ class AttestationVerifierAndSigner:
             vault_addr = getattr(
                 settings,
                 "LAZARUS_VAULT_CONTRACT_ID",
-                "CCWAH7BVPGYOEBPRFWPZIONBYUCCQH7OARGZLOD6ZV66SOAFBVA2DHD5",
+                "CBKFA2F7RUDGLJNE3K5X2XEXVXRJQ5AMB2NSPREDTATE2ZHDALFKPGUR",
             )
 
             signature_hex = self._sign_canonical_voucher(
