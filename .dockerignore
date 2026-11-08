@@ -1,0 +1,29 @@
+# Python virtual environments & bytecode
+.venv
+venv
+env
+__pycache__
+*.py[cod]
+*$py.class
+*.so
+
+# Databases & local storage
+*.sqlite3
+db.sqlite3
+staticfiles
+media
+
+# Testing & coverage
+.pytest_cache
+.coverage
+htmlcov
+*.log
+
+# Git, IDE & Environment secrets
+.git
+.gitignore
+.vscode
+.idea
+.DS_Store
+.env
+.env.local
