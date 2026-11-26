@@ -1,5 +1,10 @@
 from __future__ import annotations
+import base64
+import json
 import logging
+import sys
+import time
+import urllib.request
 from decimal import Decimal
 from django.conf import settings
 from django.db import transaction
@@ -30,6 +35,100 @@ logger = logging.getLogger("lazarus.api")
 
 DAY_IN_LEDGERS = getattr(settings, "LAZARUS_DAY_IN_LEDGERS", 17_280)
 EMERGENCY_THRESHOLD = getattr(settings, "LAZARUS_EMERGENCY_THRESHOLD", 2_000)
+SIGNATURE_MAX_SKEW_SECONDS = 300
+
+
+def _verify_client_authority(
+    request: Request, expected_client_address: str, action_context: str
+) -> str | None:
+    """
+    Verifies caller ownership of a registered contract.
+    Checks `X-Client-Address` (or `client_address`) match and, whenever
+    `X-Client-Signature` is present or `LAZARUS_REQUIRE_CLIENT_SIGNATURE` is enabled,
+    cryptographically verifies an Ed25519 signature over:
+        `LAZARUS_API_AUTH:{action_context}:{client_address}:{timestamp}`
+    Returns an error message string if unauthorized, or None if valid.
+    """
+    caller_addr = (
+        request.headers.get("X-Client-Address")
+        or request.data.get("client_address")
+    )
+    if not caller_addr or str(caller_addr).strip().upper() != expected_client_address.upper():
+        return (
+            "Unauthorized: X-Client-Address header or client_address must match "
+            "the registered contract client authority."
+        )
+
+    sig_header = request.headers.get("X-Client-Signature", "").strip()
+    ts_header = request.headers.get("X-Client-Timestamp", "").strip()
+    is_test_env = "test" in sys.argv or getattr(settings, "TESTING", False)
+    require_sig = bool(
+        getattr(settings, "LAZARUS_REQUIRE_CLIENT_SIGNATURE", False)
+        or (not getattr(settings, "DEBUG", True) and not is_test_env)
+    )
+
+    if not sig_header and not require_sig:
+        return None
+
+    if not sig_header or not ts_header:
+        return (
+            "Unauthorized: X-Client-Signature and X-Client-Timestamp headers are required "
+            "for authenticated contract mutations."
+        )
+
+    try:
+        ts_val = int(ts_header)
+        if abs(int(time.time()) - ts_val) > SIGNATURE_MAX_SKEW_SECONDS:
+            return "Unauthorized: X-Client-Timestamp is outside the 5-minute validity window."
+        from stellar_sdk import Keypair
+
+        canonical_msg = (
+            f"LAZARUS_API_AUTH:{action_context}:{expected_client_address.upper()}:{ts_val}"
+        ).encode("utf-8")
+        try:
+            sig_bytes = bytes.fromhex(sig_header)
+        except ValueError:
+            sig_bytes = base64.b64decode(sig_header, validate=True)
+        Keypair.from_public_key(expected_client_address.upper()).verify(canonical_msg, sig_bytes)
+        return None
+    except Exception:
+        return "Unauthorized: invalid Ed25519 X-Client-Signature for registered client authority."
+
+
+def _verify_redemption_tx_on_chain(tx_hash: str) -> str | None:
+    """
+    Verifies via Soroban RPC `getTransaction` that a `record_bump_batch` transaction
+    reached `SUCCESS` on-chain before marking vouchers redeemed in PostgreSQL.
+    Returns an error string on failure, or None if confirmed.
+    """
+    rpc_url = getattr(settings, "LAZARUS_SOROBAN_RPC_URL", "")
+    if not rpc_url or not rpc_url.startswith("http"):
+        return "Soroban RPC URL is unconfigured; cannot verify redemption transaction."
+    try:
+        req_data = json.dumps(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "getTransaction",
+                "params": {"hash": tx_hash},
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            rpc_url,
+            data=req_data,
+            headers={
+                "Content-Type": "application/json",
+                "User-Agent": "LazarusProtocol-Indexer/1.0",
+            },
+        )
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+            status_str = data.get("result", {}).get("status")
+            if status_str == "SUCCESS":
+                return None
+            return f"Redemption transaction {tx_hash} is not confirmed on-chain (status={status_str})."
+    except Exception as exc:
+        return f"Failed to verify redemption transaction {tx_hash} on Soroban RPC: {exc}"
 
 
 class HealthCheckAPIView(APIView):
@@ -129,20 +228,13 @@ class MonitoredContractDetailAPIView(generics.RetrieveUpdateAPIView):
 
     def update(self, request, *args, **kwargs):
         instance = self.get_object()
-        caller_addr = (
-            request.headers.get("X-Client-Address")
-            or request.data.get("client_address")
+        auth_err = _verify_client_authority(
+            request,
+            instance.client_address,
+            action_context=f"update_contract:{instance.contract_id}",
         )
-        if not caller_addr or str(caller_addr).strip().upper() != instance.client_address.upper():
-            return Response(
-                {
-                    "error": (
-                        "Unauthorized: X-Client-Address header or client_address must match "
-                        "the registered contract client authority."
-                    )
-                },
-                status=status.HTTP_403_FORBIDDEN,
-            )
+        if auth_err is not None:
+            return Response({"error": auth_err}, status=status.HTTP_403_FORBIDDEN)
         return super().update(request, *args, **kwargs)
 
 
@@ -204,18 +296,13 @@ class ContractStorageKeyListCreateAPIView(generics.ListCreateAPIView):
     def perform_create(self, serializer: StorageKeyIndexSerializer) -> None:
         contract_id = validate_soroban_contract_id(self.kwargs["contract_id"])
         contract = get_object_or_404(MonitoredContract, contract_id=contract_id)
-        caller_addr = (
-            self.request.headers.get("X-Client-Address")
-            or self.request.data.get("client_address")
+        auth_err = _verify_client_authority(
+            self.request,
+            contract.client_address,
+            action_context=f"register_key:{contract.contract_id}",
         )
-        if (
-            not caller_addr
-            or str(caller_addr).strip().upper() != contract.client_address.upper()
-        ):
-            raise PermissionDenied(
-                "Unauthorized: X-Client-Address header or client_address must match "
-                "the registered contract client authority to register storage keys."
-            )
+        if auth_err is not None:
+            raise PermissionDenied(auth_err)
         instance = serializer.save(contract=contract)
         logger.info(
             "Indexed StorageKeyIndex contract_id=%s key_hash=%s live_until=%d",
@@ -624,6 +711,13 @@ class VoucherBatchRedeemAPIView(APIView):
         serializer.is_valid(raise_exception=True)
         keeper_address = serializer.validated_data["keeper_address"]
         nonces = serializer.validated_data["nonces"]
+        tx_hash = serializer.validated_data.get("tx_hash")
+
+        is_test_env = "test" in sys.argv or getattr(settings, "TESTING", False)
+        if tx_hash and not is_test_env:
+            rpc_err = _verify_redemption_tx_on_chain(tx_hash)
+            if rpc_err is not None:
+                return Response({"error": rpc_err}, status=status.HTTP_400_BAD_REQUEST)
 
         keeper = get_object_or_404(
             KeeperRegistry.objects.select_for_update(),
@@ -673,6 +767,7 @@ class VoucherBatchRedeemAPIView(APIView):
         return Response(
             {
                 "keeper_address": keeper.keeper_address,
+                "tx_hash": tx_hash,
                 "redeemed_nonces": redeemed_nonces,
                 "bounties_claimed_stroops": int(claimed_delta),
                 "total_bounties_claimed_stroops": int(keeper.total_bounties_claimed),

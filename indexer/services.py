@@ -165,6 +165,136 @@ class RPCCatchUpReconciler:
     PAGE_LIMIT = 100
     MAX_PAGES = 50
 
+    @staticmethod
+    def _extract_contract_mutations_from_ledger_meta(
+        metadata_xdr: str,
+        contract: MonitoredContract,
+        ledger_seq: int,
+    ) -> List[Dict[str, Any]]:
+        """
+        Parses a Soroban `LedgerCloseMeta` XDR blob to extract created, updated,
+        or restored `CONTRACT_DATA` keys and `TTL` updates belonging to `contract`.
+        """
+        if not metadata_xdr:
+            return []
+        try:
+            import hashlib
+            from stellar_sdk import StrKey, xdr as stellar_xdr
+            from .xdr_utils import decode_stellar_address_32
+
+            target_bytes_32 = decode_stellar_address_32(contract.contract_id)
+            lcm = stellar_xdr.LedgerCloseMeta.from_xdr(metadata_xdr)
+            inner = lcm.v2 if lcm.v == 2 else (lcm.v1 if lcm.v == 1 else None)
+            if inner is None:
+                return []
+
+            ttl_by_hash: Dict[str, int] = {}
+            matched_keys: Dict[str, Dict[str, Any]] = {}
+
+            def _inspect_change(change: Any) -> None:
+                entry = (
+                    getattr(change, "created", None)
+                    or getattr(change, "updated", None)
+                    or getattr(change, "restored", None)
+                )
+                if entry is None:
+                    return
+                data = entry.data
+                if data.type == stellar_xdr.LedgerEntryType.TTL and data.ttl is not None:
+                    kh = data.ttl.key_hash.hash.hex()
+                    ttl_by_hash[kh] = int(data.ttl.live_until_ledger_seq.uint32)
+                elif (
+                    data.type == stellar_xdr.LedgerEntryType.CONTRACT_DATA
+                    and data.contract_data is not None
+                ):
+                    cd = data.contract_data
+                    if (
+                        cd.contract.type == stellar_xdr.SCAddressType.SC_ADDRESS_TYPE_CONTRACT
+                        and cd.contract.contract_id is not None
+                        and cd.contract.contract_id.hash == target_bytes_32
+                    ):
+                        if cd.durability == stellar_xdr.ContractDataDurability.TEMPORARY:
+                            return
+                        lk = stellar_xdr.LedgerKey(
+                            type=stellar_xdr.LedgerEntryType.CONTRACT_DATA,
+                            contract_data=stellar_xdr.LedgerKeyContractData(
+                                contract=cd.contract,
+                                key=cd.key,
+                                durability=cd.durability,
+                            ),
+                        )
+                        raw_xdr = lk.to_xdr_bytes()
+                        key_hash = hashlib.sha256(raw_xdr).hexdigest()
+                        durability = (
+                            "instance"
+                            if cd.key.type
+                            == stellar_xdr.SCValType.SCV_LEDGER_KEY_CONTRACT_INSTANCE
+                            else "persistent"
+                        )
+                        matched_keys[key_hash] = {
+                            "key_hash": key_hash,
+                            "key_xdr": lk.to_xdr(),
+                            "durability": durability,
+                        }
+
+            for tx_meta in getattr(inner, "tx_processing", []) or []:
+                apply_meta = getattr(tx_meta, "tx_apply_processing", None)
+                if apply_meta is None:
+                    continue
+                tx_v = getattr(apply_meta, "v4", None) or getattr(apply_meta, "v3", None)
+                if tx_v is None:
+                    continue
+                for op_meta in getattr(tx_v, "operations", []) or []:
+                    changes = getattr(getattr(op_meta, "changes", None), "ledger_entry_changes", [])
+                    for ch in changes or []:
+                        _inspect_change(ch)
+
+            mutations: List[Dict[str, Any]] = []
+            for key_hash, info in matched_keys.items():
+                live_until = ttl_by_hash.get(key_hash, ledger_seq + contract.bump_target)
+                StorageKeyIndex.objects.update_or_create(
+                    contract=contract,
+                    key_hash=key_hash,
+                    defaults={
+                        "key_xdr": info["key_xdr"],
+                        "durability": info["durability"],
+                        "live_until_ledger_seq": live_until,
+                        "last_extended_ledger": ledger_seq,
+                    },
+                )
+                mutations.append({**info, "live_until_ledger_seq": live_until})
+
+            # Also update TTLs for any already-indexed keys touched in this ledger
+            if ttl_by_hash:
+                existing_qs = StorageKeyIndex.objects.filter(
+                    contract=contract, key_hash__in=list(ttl_by_hash.keys())
+                )
+                for obj in existing_qs:
+                    new_ttl = ttl_by_hash[obj.key_hash]
+                    if new_ttl != obj.live_until_ledger_seq:
+                        obj.live_until_ledger_seq = new_ttl
+                        obj.last_extended_ledger = ledger_seq
+                        obj.save(
+                            update_fields=[
+                                "live_until_ledger_seq",
+                                "last_extended_ledger",
+                                "updated_at",
+                            ]
+                        )
+                        if obj.key_hash not in matched_keys:
+                            mutations.append(
+                                {
+                                    "key_hash": obj.key_hash,
+                                    "live_until_ledger_seq": new_ttl,
+                                }
+                            )
+            return mutations
+        except Exception as exc:
+            pipeline_logger.debug(
+                "Pipeline B metadataXdr parse skipped at ledger=%d: %s", ledger_seq, exc
+            )
+            return []
+
     def reconcile_gap(
         self,
         contract: MonitoredContract,
@@ -215,6 +345,17 @@ class RPCCatchUpReconciler:
                         pages_fetched += 1
                         if not ledgers:
                             break
+                        for ledger_obj in ledgers:
+                            meta_xdr = ledger_obj.get("metadataXdr") or ""
+                            l_seq = int(ledger_obj.get("sequence", current_seq))
+                            if meta_xdr:
+                                replayed_mutations.extend(
+                                    self._extract_contract_mutations_from_ledger_meta(
+                                        metadata_xdr=meta_xdr,
+                                        contract=contract,
+                                        ledger_seq=l_seq,
+                                    )
+                                )
                         last_seq = int(ledgers[-1].get("sequence", current_seq))
                         cursor = result.get("cursor") or ledgers[-1].get("pagingToken")
                         if last_seq >= target_head or not cursor:

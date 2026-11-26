@@ -236,9 +236,13 @@ class VoucherBatchRedeemRequestSerializer(serializers.Serializer):
         min_length=1,
         max_length=10,
     )
+    tx_hash = serializers.CharField(max_length=64, required=False, allow_blank=False)
 
     def validate_keeper_address(self, value: str) -> str:
         return validate_stellar_address(value, "keeper_address")
+
+    def validate_tx_hash(self, value: str) -> str:
+        return validate_tx_hash(value)
 
     def validate_nonces(self, value: list[int]) -> list[int]:
         if len(set(value)) != len(value):
